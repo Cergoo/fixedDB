@@ -81,14 +81,18 @@ type (
 // Create new BD files
 func CreateDB(path string, h THeaderCreate) (e error) {
 	var (
-		dirname, bucketname string
-		f                   *os.File
+		dirname    string
+		bucketname string
+		f          *os.File
 	)
 	path = filepath.PathEndSeparator(path)
 
 	// create HeaderBase from HeaderCreate
-	HeaderBase := THeaderBase{Buckets: make([]*tBucket, 0, len(h.Buckets))}
-	HeaderBase.FileSize = h.FileSize
+	HeaderBase := THeaderBase{
+		Buckets:  make([]*tBucket, 0, len(h.Buckets)),
+		FileSize: h.FileSize,
+	}
+
 	for _, val := range h.Buckets {
 		HeaderBase.Buckets = append(HeaderBase.Buckets, &tBucket{PartLen: val, MaxIdPerFile: int64(h.FileSize) * 1024 * 1024 * 1024 / int64(val)})
 	}
@@ -145,60 +149,45 @@ func OpenDB(path string, threadCount uint8, timeOnSleep time.Duration) (t *TDB, 
 		logErr:     log.New(os.Stderr, "fixedDB: ", log.LstdFlags),
 		dispatcher: mrswd.New(uint16(threadCount), timeOnSleep),
 	}
-	//fmt.Println(t.path)
+
 	jsonConfig.Load(t.path+"config.json", &t.h)
 	sort.Sort(t.h.Buckets)
 
 	var (
-		dir        []os.FileInfo
-		f          os.FileInfo
-		i1, imax   int64
 		bucketName string
 		fileName   string
 		tmpstr     string
 		log        []byte
 		bucketid   uint32
 		b          *tBucket
+		buketFiles *tBuketFiles
 	)
 
 	// range of a buckets in database
 	for _, v := range t.h.Buckets {
+
 		v.emptyid = bytestack.New(emptyidLen)
 		bucketName = strconv.FormatInt(int64(v.PartLen), 16)
-		if dir, e = ioutil.ReadDir(t.path + bucketName); e != nil {
+
+		buketFiles, e = parseBuketFiles(t.path + bucketName)
+		if e != nil {
 			return
 		}
 
-		if len(dir) == 0 {
-			e = errors.New("Not database file: " + t.path + bucketName + "/")
-			return
-		}
+		v.files = make([]*tAccessor, buketFiles.max+1)
 
-		// get max file name
-		for _, f = range dir {
-			i1, e = strconv.ParseInt(f.Name(), 10, 32)
+		for _, f := range buketFiles.files {
+			fileName = t.path + bucketName + string(os.PathSeparator) + f.valstr
+
+			v.files[f.valint] = new(tAccessor)
+			v.files[f.valint].writer, e = os.OpenFile(fileName, os.O_RDWR, 0666)
 			if e != nil {
-				e = errors.New("It's not database file: " + t.path + bucketName + "/" + f.Name())
 				return
 			}
-			if i1 > imax {
-				imax = i1
-			}
-		}
 
-		v.files = make([]*tAccessor, imax+1)
-
-		// range of a files in bucket
-		for _, f = range dir {
-			i1, _ = strconv.ParseInt(f.Name(), 10, 32)
-			fileName = t.path + bucketName + string(os.PathSeparator) + f.Name()
-			v.files[i1] = new(tAccessor)
-			if v.files[i1].writer, e = os.OpenFile(fileName, os.O_RDWR, 0666); e != nil {
-				return
-			}
-			v.files[i1].reader = make([]*os.File, threadCount)
-			for j := range v.files[i1].reader {
-				v.files[i1].reader[j], e = os.OpenFile(fileName, os.O_RDONLY, 0666)
+			v.files[f.valint].reader = make([]*os.File, threadCount)
+			for j := range v.files[f.valint].reader {
+				v.files[f.valint].reader[j], e = os.OpenFile(fileName, os.O_RDONLY, 0666)
 				if e != nil {
 					return
 				}
@@ -329,9 +318,8 @@ func (t *TDB) Get(key []byte) (val []byte) {
 	}
 
 	i := t.dispatcher.RLock(string(key))
-	f := bucket.files[fileid].reader[i]
 	val = make([]byte, bucket.PartLen)
-	_, e := f.ReadAt(val, recordAt)
+	_, e := bucket.files[fileid].reader[i].ReadAt(val, recordAt)
 	t.dispatcher.RUnlock(i)
 
 	t.logWrite(e)
@@ -470,12 +458,13 @@ func (t *TDB) prepareWrite(key, val []byte) (f1 *os.File, f2 *os.File, recordAt1
 func (t *TDB) set() {
 
 	var (
-		recordAt1, recordAt2 int64
-		f1, f2               *os.File
-		newkey               []byte
-		record               *tSetRecord
-		e                    error
-		logCount             uint32
+		recordAt1 int64
+		recordAt2 int64
+		f1, f2    *os.File
+		newkey    []byte
+		record    *tSetRecord
+		e         error
+		logCount  uint32
 	)
 
 	defer func() {

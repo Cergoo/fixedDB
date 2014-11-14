@@ -6,10 +6,11 @@ package fixedDBv2
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
+
 	"github.com/Cergoo/gol/err"
 	"github.com/Cergoo/gol/stack/bytestack"
 	"github.com/Cergoo/gol/util"
-	"os"
 )
 
 type (
