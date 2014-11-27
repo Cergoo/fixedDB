@@ -20,15 +20,9 @@ type (
 		MaxIdPerFile int64             //
 		currentId    int64             //
 		PartLen      uint32            // bucket parts len in bytes
-		files        []*tAccessor      //
+		files        []*os.File        //
 		emptyid      *bytestack.TStack // empty id
 		emptyFile    *os.File          //
-	}
-
-	// accessor to each file
-	tAccessor struct {
-		writer *os.File
-		reader []*os.File
 	}
 )
 
@@ -56,7 +50,7 @@ func (t *tBucket) setEmpty() (e error) {
 	lastFile := len(t.files) - 1
 	// range files of bucket
 	for fid := 0; fid <= lastFile; fid++ {
-		f = t.files[fid].reader[0]
+		f = t.files[fid]
 		for n := t.MaxIdPerFile; n > 0; n-- {
 			f.ReadAt(b, n*int64(t.PartLen))
 			if util.Zero(b) {

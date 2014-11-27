@@ -11,18 +11,15 @@ import (
 	"github.com/Cergoo/gol/filepath"
 	"github.com/Cergoo/gol/jsonConfig"
 	"github.com/Cergoo/gol/stack/bytestack"
-	"github.com/Cergoo/gol/sync/mrswString/mrswd"
 
 	//"github.com/davecgh/go-spew/spew"
 	"hash/crc32"
 	"io/ioutil"
 	"log"
 	"os"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"sync"
-	"time"
 )
 
 /*
@@ -47,22 +44,23 @@ const (
 	ErrFileNotFound
 )
 
+const (
+	workTypeGet = iota
+	workTypeSet
+	workTypeDel
+)
+
 type (
-	tSetRecord struct {
-		key, val []byte
-		newkey   chan<- []byte
-	}
 
 	// TDB it's a base main struct
 	TDB struct {
-		h          THeaderBase      //
-		path       string           // path to database
-		chWriter   chan *tSetRecord //
-		closeWait  sync.WaitGroup   //
-		maxDataLen uint32           //
-		logErr     *log.Logger      //
-		logFile    *os.File         //
-		dispatcher mrswd.TDispatcher
+		chWorker   chan interface{}
+		h          THeaderBase    //
+		path       string         // path to database
+		closeWait  sync.WaitGroup //
+		maxDataLen uint32         //
+		logErr     *log.Logger    //
+		logFile    *os.File       //
 	}
 
 	// THeaderBase type: first item maxid, second recordLength
@@ -75,6 +73,20 @@ type (
 	THeaderCreate struct {
 		Buckets  []uint32 // bucket size bytes
 		FileSize uint16   // max files size Gb
+	}
+
+	tWorkWrite struct {
+		f   *os.File
+		at  int64
+		key []byte
+		val []byte
+	}
+
+	tWorkRead struct {
+		f  *os.File
+		at int64
+		ln uint32
+		ch chan<- []byte
 	}
 )
 
@@ -140,14 +152,13 @@ func CreateDB(path string, h THeaderCreate) (e error) {
 }
 
 // Open BD files
-func OpenDB(path string, threadCount uint8, timeOnSleep time.Duration) (t *TDB, e error) {
+func OpenDB(path string) (t *TDB, e error) {
 
 	t = &TDB{
-		h:          THeaderBase{},
-		chWriter:   make(chan *tSetRecord, 10),
-		path:       filepath.PathEndSeparator(path),
-		logErr:     log.New(os.Stderr, "fixedDB: ", log.LstdFlags),
-		dispatcher: mrswd.New(uint16(threadCount), timeOnSleep),
+		h:        THeaderBase{},
+		chWorker: make(chan interface{}, 10),
+		path:     filepath.PathEndSeparator(path),
+		logErr:   log.New(os.Stderr, "fixedDB: ", log.LstdFlags),
 	}
 
 	jsonConfig.Load(t.path+"config.json", &t.h)
@@ -155,7 +166,6 @@ func OpenDB(path string, threadCount uint8, timeOnSleep time.Duration) (t *TDB, 
 
 	var (
 		bucketName string
-		fileName   string
 		tmpstr     string
 		log        []byte
 		bucketid   uint32
@@ -174,23 +184,12 @@ func OpenDB(path string, threadCount uint8, timeOnSleep time.Duration) (t *TDB, 
 			return
 		}
 
-		v.files = make([]*tAccessor, buketFiles.max+1)
+		v.files = make([]*os.File, buketFiles.max+1)
 
 		for _, f := range buketFiles.files {
-			fileName = t.path + bucketName + string(os.PathSeparator) + f.valstr
-
-			v.files[f.valint] = new(tAccessor)
-			v.files[f.valint].writer, e = os.OpenFile(fileName, os.O_RDWR, 0666)
+			v.files[f.valint], e = os.OpenFile(t.path+bucketName+string(os.PathSeparator)+f.valstr, os.O_RDWR, 0666)
 			if e != nil {
 				return
-			}
-
-			v.files[f.valint].reader = make([]*os.File, threadCount)
-			for j := range v.files[f.valint].reader {
-				v.files[f.valint].reader[j], e = os.OpenFile(fileName, os.O_RDONLY, 0666)
-				if e != nil {
-					return
-				}
 			}
 		}
 
@@ -247,7 +246,7 @@ func OpenDB(path string, threadCount uint8, timeOnSleep time.Duration) (t *TDB, 
 
 	t.maxDataLen = t.h.Buckets[len(t.h.Buckets)-1].PartLen
 	t.closeWait.Add(1)
-	go t.set()
+	go t.worker()
 	//spew.Dump(t)
 	return
 }
@@ -255,7 +254,7 @@ func OpenDB(path string, threadCount uint8, timeOnSleep time.Duration) (t *TDB, 
 // Close close opened DB
 func (t *TDB) Close() {
 	// wait finished write
-	close(t.chWriter)
+	close(t.chWorker)
 	t.closeWait.Wait()
 
 	// flash Log
@@ -264,18 +263,16 @@ func (t *TDB) Close() {
 	// close all file
 	for _, v := range t.h.Buckets {
 		for _, f := range v.files {
-			f.writer.Close()
-			for j := range f.reader {
-				f.reader[j].Close()
-			}
+			f.Close()
 		}
 		v.emptyFile.Close()
 	}
 	t.logFile.Close()
 }
 
-//
-func (t *TDB) Set(key []byte, val []byte) (newkey <-chan []byte, e error) {
+// Set - Set(key, val)
+// Del - Set(key, nil)
+func (t *TDB) Set(key []byte, val []byte) (newKey []byte, e error) {
 	if uint32(len(val)) > t.maxDataLen {
 		e = fmt.Errorf(errMaxRecordLen, t.maxDataLen)
 		return
@@ -292,42 +289,91 @@ func (t *TDB) Set(key []byte, val []byte) (newkey <-chan []byte, e error) {
 		}
 	}
 
+	if val == nil {
+		// remove to old
+		bucketid, fileid, recordAt := keyParse(key)
+		bucket, _ := t.h.Buckets.Search(bucketid)
+		t.chWorker <- &tWorkWrite{
+			f:   bucket.files[fileid],
+			at:  recordAt,
+			key: key,
+		}
+		return
+	}
+
+	var (
+		f1        *os.File
+		recordAt1 int64
+	)
+
 	binary.LittleEndian.PutUint32(val[:4], uint32(len(val)-headerLen))
 	binary.LittleEndian.PutUint32(val[4:8], crc32.ChecksumIEEE(val[headerLen:]))
 
-	r := make(chan []byte)
-	t.chWriter <- &tSetRecord{key: key, val: val, newkey: r}
-	newkey = r
+	bucket, _ := t.h.Buckets.Search(uint32(len(val)))
+
+	if key == nil {
+		// write to new
+		f1, recordAt1, newKey = t.getNewID(bucket)
+		t.chWorker <- &tWorkWrite{
+			f:   f1,
+			at:  recordAt1,
+			key: newKey,
+			val: val,
+		}
+		return
+	}
+
+	bucketid, fileid, recordAt := keyParse(key)
+
+	if bucketid == bucket.PartLen {
+		// write to old
+		newKey = key
+		t.chWorker <- &tWorkWrite{
+			f:   bucket.files[fileid],
+			at:  recordAt,
+			key: key,
+			val: val,
+		}
+	} else {
+		// write to new
+		f1, recordAt1, newKey = t.getNewID(bucket)
+		t.chWorker <- &tWorkWrite{
+			f:   f1,
+			at:  recordAt1,
+			key: newKey,
+			val: val,
+		}
+		// remove to old
+		t.chWorker <- &tWorkWrite{
+			f:   bucket.files[fileid],
+			at:  recordAt,
+			key: key,
+		}
+	}
 	return
 }
 
-func (t *TDB) Del(key []byte) {
-	if len(key) == keyLen {
-		t.chWriter <- &tSetRecord{key: key}
-	}
-}
-
-func (t *TDB) Get(key []byte) (val []byte) {
+func (t *TDB) Get(key []byte) []byte {
 	if len(key) != keyLen {
-		return
+		return nil
 	}
 	bucketid, fileid, recordAt := keyParse(key)
 	bucket, _ := t.h.Buckets.Search(bucketid)
 	if bucketid != bucket.PartLen {
-		return
+		return nil
 	}
 
-	i := t.dispatcher.RLock(string(key))
-	val = make([]byte, bucket.PartLen)
-	_, e := bucket.files[fileid].reader[i].ReadAt(val, recordAt)
-	t.dispatcher.RUnlock(i)
-
-	t.logWrite(e)
-	return
+	ch := make(chan []byte, 1)
+	t.chWorker <- &tWorkRead{
+		f:  bucket.files[fileid],
+		at: recordAt,
+		ln: bucketid,
+		ch: ch,
+	}
+	return <-ch
 }
 
 func (t *TDB) flashLog() (e error) {
-
 	for _, b := range t.h.Buckets {
 		v := make([]byte, 8, len(b.emptyid.Stack)+8)
 		binary.LittleEndian.PutUint32(v, uint32(b.currentId))
@@ -353,35 +399,20 @@ func (t *TDB) flashLog() (e error) {
 	return
 }
 
-func (t *TDB) logWrite(e error) {
-	if e != nil {
-		t.logErr.Println(e)
-	}
-}
-
 // addFile add new part file to bucket
 func (t *TDB) addFile(b *tBucket) (e error) {
-	access := new(tAccessor)
+	var f *os.File
 	bucketName := strconv.FormatInt(int64(b.PartLen), 16)
 	fileName := t.path + bucketName + string(os.PathSeparator) + strconv.FormatInt(int64(len(b.files)), 10)
-	access.writer, e = os.Create(fileName)
+	f, e = os.Create(fileName)
 	if e != nil {
 		return
 	}
-	e = access.writer.Truncate(b.MaxIdPerFile * int64(b.PartLen))
+	e = f.Truncate(b.MaxIdPerFile * int64(b.PartLen))
 	if e != nil {
 		return
 	}
-	access.reader = make([]*os.File, len(b.files[0].reader))
-
-	for i := range access.reader {
-		access.reader[i], e = os.OpenFile(fileName, os.O_RDONLY, 0666)
-		if e != nil {
-			return
-		}
-	}
-
-	b.files = append(b.files, access)
+	b.files = append(b.files, f)
 	return
 }
 
@@ -391,7 +422,7 @@ func (t *TDB) getNewID(bucket *tBucket) (f *os.File, recordAt int64, newkey []by
 	binary.LittleEndian.PutUint32(newkey, bucket.PartLen)
 	emptyid := bucket.emptyid.PopPoint()
 	if emptyid != nil {
-		f = bucket.files[binary.LittleEndian.Uint16(emptyid[:2])].writer
+		f = bucket.files[binary.LittleEndian.Uint16(emptyid[:2])]
 		recordAt = int64(binary.LittleEndian.Uint32(emptyid[2:])) * int64(bucket.PartLen)
 		copy(newkey[4:], emptyid)
 	} else {
@@ -400,7 +431,7 @@ func (t *TDB) getNewID(bucket *tBucket) (f *os.File, recordAt int64, newkey []by
 			bucket.currentId = 0
 		}
 		fid := uint16(len(bucket.files) - 1)
-		f = bucket.files[fid].writer
+		f = bucket.files[fid]
 		recordAt = int64(bucket.currentId) * int64(bucket.PartLen)
 		binary.LittleEndian.PutUint16(newkey[4:6], fid)
 		binary.LittleEndian.PutUint32(newkey[6:], uint32(bucket.currentId))
@@ -416,101 +447,63 @@ func keyParse(key []byte) (bucketid uint32, fileid uint16, recordAt int64) {
 	return
 }
 
-func (t *TDB) prepareWrite(key, val []byte) (f1 *os.File, f2 *os.File, recordAt1 int64, recordAt2 int64, newkey []byte) {
-
-	bucket, _ := t.h.Buckets.Search(uint32(len(val)))
-	if key == nil {
-		f1, recordAt1, newkey = t.getNewID(bucket)
-		return
-	}
-
-	bucketid, fileid, recordAt := keyParse(key)
-
-	// delete
-	if val == nil {
-		bucket, _ := t.h.Buckets.Search(bucketid)
-		if bucketid == bucket.PartLen {
-			f2 = bucket.files[fileid].writer
-			recordAt2 = recordAt
-			bucket.emptyid.Push(key[4:])
-		}
-		return
-	}
-
-	if bucketid == bucket.PartLen {
-		f1 = bucket.files[fileid].writer
-		recordAt1 = recordAt
-		newkey = key
-		return
-	}
-
-	f1, recordAt1, newkey = t.getNewID(bucket)
-	bucket, _ = t.h.Buckets.Search(bucketid)
-	if bucketid == bucket.PartLen {
-		f2 = bucket.files[fileid].writer
-		recordAt2 = recordAt
-		bucket.emptyid.Push(key[4:])
-	}
-	return
-}
-
-// Set set value
-func (t *TDB) set() {
-
-	var (
-		recordAt1 int64
-		recordAt2 int64
-		f1, f2    *os.File
-		newkey    []byte
-		record    *tSetRecord
-		e         error
-		logCount  uint32
-	)
-
+// disk operations worker
+func (t *TDB) worker() {
 	defer func() {
 		t.closeWait.Done()
-		if e := recover(); e != nil {
-			close(record.newkey)
-			t.logErr.Printf("error: %s\nat:\n%s", e, debug.Stack())
-		}
 	}()
 
+	var (
+		w        interface{}
+		wr       *tWorkRead
+		ww       *tWorkWrite
+		e        error
+		logCount uint32
+	)
 	logkey := make([]byte, keyLen+1)
-	const maxLogCount = uint32(122016116) // 10Gb
+	valNil := []byte{0, 0, 0, 0}
 
-	for record = range t.chWriter {
-		f1, f2, recordAt1, recordAt2, newkey = t.prepareWrite(record.key, record.val)
+	const maxLogCount = 1000
 
-		if f1 != nil {
+	for w = range t.chWorker {
+		switch w.(type) {
+		case *tWorkRead:
+			wr = w.(*tWorkRead)
+			buf := make([]byte, wr.ln)
+			_, e = wr.f.ReadAt(buf, wr.at)
+			if e != nil {
+				wr.ch <- nil
+				t.logErr.Panicln(e)
+			}
+			wr.ch <- buf
+		case *tWorkWrite:
+			ww = w.(*tWorkWrite)
+			if ww.val == nil {
+				logkey[0] = 0
+				ww.val = valNil
+			} else {
+				logkey[0] = 1
+			}
+			copy(logkey[1:], ww.key)
 
-			logkey[0] = 1
-			copy(logkey[1:], newkey)
 			_, e = t.logFile.Write(logkey)
-			t.logWrite(e)
-			t.dispatcher.Lock(string(newkey))
-			_, e = f1.WriteAt(record.val, recordAt1)
-			t.dispatcher.Unlock()
-			t.logWrite(e)
+			if e != nil {
+				t.logErr.Panicln(e)
+			}
 
-			record.newkey <- newkey
-		}
+			_, e = ww.f.WriteAt(ww.val, ww.at)
+			if e != nil {
+				t.logErr.Panicln(e)
+			}
 
-		if f2 != nil {
-			logkey[0] = 0
-			copy(logkey[1:], record.key)
-			_, e = t.logFile.Write(logkey)
-			t.logWrite(e)
-			t.dispatcher.Lock(string(record.key))
-			_, e = f2.WriteAt([]byte{0}, recordAt2)
-			t.dispatcher.Unlock()
-			t.logWrite(e)
-		}
-
-		logCount++
-		if logCount > maxLogCount {
-			e = t.flashLog()
-			t.logWrite(e)
-			logCount = 0
+			logCount++
+			if logCount > maxLogCount {
+				e = t.flashLog()
+				if e != nil {
+					t.logErr.Panicln(e)
+				}
+				logCount = 0
+			}
 		}
 	}
 }
