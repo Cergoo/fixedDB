@@ -76,10 +76,11 @@ type (
 	}
 
 	tWorkWrite struct {
-		f   *os.File
-		at  int64
-		key []byte
-		val []byte
+		f    *os.File
+		at   int64
+		key  []byte
+		val  []byte
+		wait sync.WaitGroup
 	}
 
 	tWorkRead struct {
@@ -245,7 +246,7 @@ func OpenDB(path string) (t *TDB, e error) {
 	}
 
 	t.maxDataLen = t.h.Buckets[len(t.h.Buckets)-1].PartLen
-	t.closeWait.Add(1)
+
 	go t.worker()
 	//spew.Dump(t)
 	return
@@ -253,26 +254,13 @@ func OpenDB(path string) (t *TDB, e error) {
 
 // Close close opened DB
 func (t *TDB) Close() {
-	// wait finished write
 	close(t.chWorker)
 	t.closeWait.Wait()
-
-	// flash Log
-	t.flashLog()
-
-	// close all file
-	for _, v := range t.h.Buckets {
-		for _, f := range v.files {
-			f.Close()
-		}
-		v.emptyFile.Close()
-	}
-	t.logFile.Close()
 }
 
 // Set - Set(key, val)
 // Del - Set(key, nil)
-func (t *TDB) Set(key []byte, val []byte) (newKey []byte, e error) {
+func (t *TDB) Set(key []byte, val []byte, sync bool) (newKey []byte, e error) {
 	if uint32(len(val)) > t.maxDataLen {
 		e = fmt.Errorf(errMaxRecordLen, t.maxDataLen)
 		return
@@ -293,10 +281,15 @@ func (t *TDB) Set(key []byte, val []byte) (newKey []byte, e error) {
 		// remove to old
 		bucketid, fileid, recordAt := keyParse(key)
 		bucket, _ := t.h.Buckets.Search(bucketid)
-		t.chWorker <- &tWorkWrite{
+		p := &tWorkWrite{
 			f:   bucket.files[fileid],
 			at:  recordAt,
 			key: key,
+		}
+		p.wait.Add(1)
+		t.chWorker <- p
+		if sync {
+			p.wait.Wait()
 		}
 		return
 	}
@@ -314,11 +307,16 @@ func (t *TDB) Set(key []byte, val []byte) (newKey []byte, e error) {
 	if key == nil {
 		// write to new
 		f1, recordAt1, newKey = t.getNewID(bucket)
-		t.chWorker <- &tWorkWrite{
+		p := &tWorkWrite{
 			f:   f1,
 			at:  recordAt1,
 			key: newKey,
 			val: val,
+		}
+		p.wait.Add(1)
+		t.chWorker <- p
+		if sync {
+			p.wait.Wait()
 		}
 		return
 	}
@@ -328,28 +326,39 @@ func (t *TDB) Set(key []byte, val []byte) (newKey []byte, e error) {
 	if bucketid == bucket.PartLen {
 		// write to old
 		newKey = key
-		t.chWorker <- &tWorkWrite{
+		p := &tWorkWrite{
 			f:   bucket.files[fileid],
 			at:  recordAt,
 			key: key,
 			val: val,
 		}
+		p.wait.Add(1)
+		t.chWorker <- p
+		if sync {
+			p.wait.Wait()
+		}
 	} else {
 		// write to new
 		f1, recordAt1, newKey = t.getNewID(bucket)
-		t.chWorker <- &tWorkWrite{
+		p := &tWorkWrite{
 			f:   f1,
 			at:  recordAt1,
 			key: newKey,
 			val: val,
 		}
+		p.wait.Add(1)
+		t.chWorker <- p
 		// remove to old
 		t.chWorker <- &tWorkWrite{
 			f:   bucket.files[fileid],
 			at:  recordAt,
 			key: key,
 		}
+		if sync {
+			p.wait.Wait()
+		}
 	}
+
 	return
 }
 
@@ -449,7 +458,17 @@ func keyParse(key []byte) (bucketid uint32, fileid uint16, recordAt int64) {
 
 // disk operations worker
 func (t *TDB) worker() {
+	t.closeWait.Add(1)
 	defer func() {
+		t.flashLog()
+		// close all file
+		for _, v := range t.h.Buckets {
+			for _, f := range v.files {
+				f.Close()
+			}
+			v.emptyFile.Close()
+		}
+		t.logFile.Close()
 		t.closeWait.Done()
 	}()
 
@@ -495,6 +514,7 @@ func (t *TDB) worker() {
 			if e != nil {
 				t.logErr.Panicln(e)
 			}
+			ww.wait.Done()
 
 			logCount++
 			if logCount > maxLogCount {
